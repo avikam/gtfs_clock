@@ -7,7 +7,7 @@ use std::time::Duration;
 
 
 use prost::Message;
-use chrono::{DateTime, TimeZone, Utc, Local};
+use chrono::{DateTime, TimeZone, Utc, Local, Timelike};
 use prost::encoding::int32;
 use reqwest;
 
@@ -16,9 +16,12 @@ use log::{debug, info, warn};
 use axum::{
     extract::Path,
     extract::State, 
+    extract::Query,
+    response::Response,
     response::Json,
     routing::get,
-    Router
+    Router,
+    middleware::map_response_with_state
 };
 use serde::{Serialize, Deserialize};
 use serde_json::{json};
@@ -51,12 +54,31 @@ struct NextTrainReq {
     from: String
 }
 
+#[derive(Deserialize, Default)]
+struct NextTrainQuery {
+    future_only: Option<bool>,
+    limit_direction_departures: Option<i8>
+}
+
 #[derive(Default)]
-struct MapByStop(HashMap<String, Vec<Entry>>);
+struct MapByStop {
+    rts_timestamp: DateTime<Utc>,
+    sample_time: DateTime<Utc>,
+    cache: HashMap<String, Vec<Entry>>
+}
 
 impl MapByStop {
+    fn new(sample_time: DateTime<Utc>, rts_timestamp: DateTime<Utc>) -> Self {
+        Self {
+            rts_timestamp: rts_timestamp,
+            sample_time: sample_time,
+            cache: Default::default()
+        }
+    }
+
     fn append(&mut self, stop: String, entry: Entry) {
-        let mut value = self.0.entry(stop.to_owned()).or_default();
+        let mut value = self.cache.entry(stop.to_owned()).or_default();
+        // TODO: push sorted
         value.push(entry);
     }
 }
@@ -65,6 +87,8 @@ struct AppState {
     cache_from: RwLock<MapByStop>
 }
 
+struct TransitRtResponse(DateTime<Utc>, Vec<Entry>);
+
 #[derive(Debug)]
 enum RequestError {
     ClientError(reqwest::Error),
@@ -72,7 +96,7 @@ enum RequestError {
 }
 
 
-fn handle_transit_rt(bytes: &[u8], filter_from: String) -> Vec<Entry> {
+fn handle_transit_rt(bytes: &[u8], filter_from: String) -> TransitRtResponse {
     let mut res = vec![];
 
     let msg  = transit_realtime::FeedMessage::decode(bytes).unwrap();
@@ -106,7 +130,7 @@ fn handle_transit_rt(bytes: &[u8], filter_from: String) -> Vec<Entry> {
                     stop.arrival.as_ref().map(|a| a.delay.unwrap_or(0)).unwrap_or(0)
                 );
 
-                let entry = Entry{// format!("Train: {}, stop: {} or {} at time: {}, delay: {}", 
+                let entry = Entry{
                     stop: stop_name.unwrap_or("??").to_owned(),
                     line: route_id.to_owned(),
                     direction: stop_id.unwrap_or("??").to_owned(),
@@ -120,10 +144,14 @@ fn handle_transit_rt(bytes: &[u8], filter_from: String) -> Vec<Entry> {
         }
     }
 
-    res
+    TransitRtResponse{
+        0: ts,
+        1: res
+    }
+    
 }
 
-async fn next_train(req: NextTrainReq) -> Result<Vec<Entry>, RequestError> {
+async fn next_train(req: NextTrainReq) -> Result<TransitRtResponse, RequestError> {
     let mut headers = reqwest::header::HeaderMap::new();
     let mut api_key = reqwest::header::HeaderValue::from_str(&env::var("API_KEY").unwrap()).unwrap();
     api_key.set_sensitive(true);
@@ -159,7 +187,9 @@ async fn main() {
     env_logger::init();
 
     let state = Arc::new(
-        AppState{cache_from: RwLock::new(Default::default())}
+        AppState{
+            cache_from: RwLock::new(Default::default())
+        }
     );
 
     let mut interval = time::interval(Duration::from_millis(30000));
@@ -183,45 +213,69 @@ async fn main() {
 
                 let res = res.unwrap();
 
-                let mut new_map = MapByStop::default();
-                for ent in res.into_iter() {
+                let mut new_map = MapByStop::new(Utc::now(), res.0);
+                for ent in res.1.into_iter() {
                     debug!("Got from: {}", ent.stop);
                     let stop = ent.stop.clone();
                     new_map.append(stop, ent);
                 }
 
                 let mut s = state.cache_from.write().await;
+                _ = std::mem::replace(&mut *s, new_map);
                 
-                std::mem::replace(&mut *s, new_map);
             }
         }
     }
 }
 
-async fn next_train_handler(State(state): State<Arc<AppState>>, from: &str) -> Json<Vec<Entry>> {
+async fn next_train_handler(State(state): State<Arc<AppState>>, from: &str, future_only: Option<bool>, limit_direction_departures: Option<i8>) -> Json<Vec<Entry>> {
     let mut s = state.cache_from.read().await;
-    let cache_from = &s.0;
-    
+    let cache_from = &s.cache;
+    let sample_time = s.sample_time.timestamp_millis() / 1000;
+
+    let future_only = future_only.unwrap_or(false);
+    let limit_direction_departures = limit_direction_departures.unwrap_or(0);
+
+    let mut direction_counters: HashMap<&str, i8> = Default::default();
+
+
     match cache_from.get(from) {
-        Some(entries) => Json(entries.to_vec()),
+        Some(entries) => Json(
+            entries.iter().filter(|e| 
+                !future_only || 
+                (e.arriving_at_timestamp - sample_time) >= 0
+            ).filter(|e| {
+                *direction_counters.entry(e.direction.as_str()).or_default() += 1;
+                limit_direction_departures <= 0 || direction_counters[e.direction.as_str()] <= limit_direction_departures
+            })
+            .map(|e| e.to_owned()).collect()
+
+        ),
         None => Json(vec![])
     }
 }
 
 async fn all_next_train_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let mut s = state.cache_from.read().await;
-    let cache_from = &s.0;
+    let cache_from = &s.cache;
     
-    Json(json!({}))
+    todo!("not implemented")
 }
 
 async fn stops(State(state): State<Arc<AppState>>) -> Json<Vec<String>> {
     let mut s = state.cache_from.read().await;
-    let cache_from = &s.0;
+    let cache_from = &s.cache;
 
     let keys = cache_from.keys().map(|k| k.to_owned()).collect();
     Json(keys)
 
+}
+
+async fn set_header<A>(State(state): State<Arc<AppState>>, mut response: Response<A>) -> Response<A> {
+    let timestamp_str = (Utc::now().timestamp_millis() / 1000).to_string();
+
+    response.headers_mut().insert("x-timestamp", timestamp_str.parse().unwrap());
+    response
 }
 
 async fn web_server(_state: Arc<AppState>) {
@@ -235,11 +289,17 @@ async fn web_server(_state: Arc<AppState>) {
             all_next_train_handler
         ))
         .route("/next_train/from/:from", get(
-            |Path(from): Path<String>, state: State<Arc<AppState>>| async move { 
-                debug!("{}", from);
-                next_train_handler(state, from.as_ref()).await
+            |Path(from): Path<String>, Query(q): Query<NextTrainQuery>, state: State<Arc<AppState>>| async move { 
+                debug!("{}, {}", from, q.future_only.is_some());
+                next_train_handler(
+                    state, 
+                    from.as_ref(), 
+                    q.future_only,
+                    q.limit_direction_departures
+                ).await
             }
         ))
+        .layer(map_response_with_state(_state.clone(), set_header))
         .with_state(_state)
     ;
 
