@@ -27,7 +27,6 @@ CRGB leds[NUM_LEDS];
 
 const char* ssid = "";
 const char* password = "";
-
 ESP8266WebServer server(80);
 
 const int led = LED_BUILTIN;
