@@ -1,18 +1,22 @@
 #define FASTLED_ESP8266_NODEMCU_PIN_ORDER
 
 #include <ESP8266HTTPClient.h>
-#include <ESP8266WebServer.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266mDNS.h>
 #include <WiFiClient.h>
-#include <string>
-
-#include "json.hpp"
-
 #include <FastLED.h>
+#include <LittleFS.h>
+
+#include <string>
+#include <vector>
+
+#include <NextStopClient.hpp>
+#include <Config.hpp>
+#include <symbol.hpp>
 
 // How many leds in your strip?
-#define NUM_LEDS 8 * 32
+#define LED_COLS 32
+#define NUM_LEDS (8*LED_COLS)
 
 // For led chips like WS2812, which have a data line, ground, and power, you just
 // need to define DATA_PIN.  For led chipsets that are SPI based (four wires 0 data, clock,
@@ -25,293 +29,296 @@ int G_BRIGHTNESS = 2;
 // Define the array of leds
 CRGB leds[NUM_LEDS];
 
-const char* ssid = "";
-const char* password = "";
 ESP8266WebServer server(80);
+static const char* deviceName = "NextStop"; 
+static const char* timestampHeader = "x-timestamp";
+static const char* headerKeys[] = {
+    timestampHeader
+};
+#define HEADERS_KEYS_SIZE 1
 
-const int led = LED_BUILTIN;
 
-using json = nlohmann::json;
+#define IDLE_CYCLES 10
+using vec_iter = std::vector<int>::iterator;
 
-void handleRoot() {
-  digitalWrite(led, 1);
-  server.send(200, "text/plain", "hello from esp8266!");
-  digitalWrite(led, 0);
-}
+class NextStopClient {
+  std::string _url;
 
-void handleNotFound() {
-  digitalWrite(led, 1);
-  String message = "File Not Found\n\n";
-  message += "URI: ";
-  message += server.uri();
-  message += "\nMethod: ";
-  message += (server.method() == HTTP_GET) ? "GET" : "POST";
-  message += "\nArguments: ";
-  message += server.args();
-  message += "\n";
-  for (uint8_t i = 0; i < server.args(); i++) {
-    message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
+  public:
+  NextStopClient() {};
+
+  void setUrl(const std::string&& url) {
+    _url = url;
   }
-  server.send(404, "text/plain", message);
-  digitalWrite(led, 0);
-}
 
-void clientTest() {
-  WiFiClient client;
-  HTTPClient http;
+  int getNextStops(vec_iter begin, const vec_iter& end) {
+    if (_url.length() == 0) {
+      Serial.print("Client not configured!\n");
+      return 0;
+    }
 
-  Serial.print("[HTTP] begin...\n");
-  const char* headerKeys[] = {
-    "x0timestamp"
-  };
+    if (begin == end) {
+      Serial.print("Err: empty result buffer\n");
+      return 0;
+    }
 
-  http.collectHeaders(headerKeys, 1);
-  if (http.begin(client, "http://192.168.1.3:3000/next_train/from/116%20St0Columbia%20University?future_only=true&limit_direction_departures=3")) {  // HTTP
+    WiFiClient client;
+    HTTPClient http;
+
+    Serial.print("[HTTP] begin...\n");
+
+    http.collectHeaders(headerKeys, HEADERS_KEYS_SIZE);
+    if (!http.begin(client, String(_url.c_str()))) {  // HTTP
+      Serial.printf("[HTTP} Unable to connect\n");
+      return 0;
+    }
 
     Serial.print("[HTTP] GET...\n");
     // start connection and send HTTP header
     int httpCode = http.GET();
 
     // httpCode will be negative on error
-    if (httpCode > 0) {
-      // HTTP header has been send and Server response header has been handled
-      Serial.printf("[HTTP] GET... code: %d\n", httpCode);
+    if (httpCode <= 0) {
+        Serial.printf("[HTTP] GET... failed, error: %s\n", http.errorToString(httpCode).c_str());
+        http.end();
+        return 0;
+    }
 
-      if (httpCode == HTTP_CODE_OK) {
-        String payload = http.getString();
-        // Serial.println(payload);
+    // HTTP header has been send and Server response header has been handled
+    Serial.printf("[HTTP] GET... code: %d\n", httpCode);
 
-        String timestamp_str = http.header("x0timestamp");
-        int64_t sample_ts = std::stoll(std::string(timestamp_str.c_str()));
+    if (httpCode != HTTP_CODE_OK) {
+      http.end();
+      return 0;
+    }
 
-        json data = json::parse(payload);
-        for (json::iterator it = data.begin(); it != data.end(); ++it) {
-          std::string s = (*it)["direction"].get<std::string>();
-          int64_t arriving_at = (*it)["arriving_at_timestamp"].get<int64_t>();
+    auto payload = http.getString();
+    auto timestamp_str = http.header(timestampHeader);
 
-          // Serial.println(
-          //   String(s.c_str()) + " arrives in " + (arriving_at - sample_ts)/60
-          // );
-        }
-      }
-    } else {
-      Serial.printf("[HTTP] GET... failed, error: %s\n", http.errorToString(httpCode).c_str());
+    auto result = next_stop::next_minutes(timestamp_str.c_str(), payload);
+    int c = 0;
+    for (auto i : result) {
+      *begin = i; c++;
+      if (++begin == end) { break; }
     }
 
     http.end();
-  } else {
-    Serial.printf("[HTTP} Unable to connect\n");
+    return c;
+  }
+};
+
+void setupWifi(const char* ssid, const char* password) {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.println("");
+
+  // Wait for connection
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.print("Connected to ");
+  Serial.println(ssid);
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  if (MDNS.begin(deviceName)) {
+    Serial.println("MDNS responder started");
+  }  
+}
+
+void setupLeds() {
+  FastLED.addLeds<WS2812B, DATA_PIN, RGB>(leds, NUM_LEDS);  // GRB ordering is typical
+  FastLED.setBrightness(G_BRIGHTNESS);
+  // Serial.println("Added leds");
+}
+
+void drawColumn(int col, const char* row, CRGB color){
+  if (col < 0 || col >= LED_COLS) {
+    Serial.printf("Error col bounds (%d)\n", col);
+    return;
+  }
+
+  for (int i = 0 ; i < 8; i++) {
+    auto d = row[(col % 2) == 0 ? i : 7 - i];
+    auto pix = col * 8 + i;
+    if (pix < NUM_LEDS) leds[pix] = color * (uint8_t)d;
   }
 }
 
-void beginServer() {
-  server.on("/", handleRoot);
-  server.on("/inline", []() { server.send(200, "text/plain", "this works as well"); });
-  server.on("/on", []() {
-    digitalWrite(led, 0);
-    server.send(200, "text/plain", "this works as well");
-  });
+template <class Sym, class Iter>
+int drawSymbol(int col, const symbol::ISymbol<Sym, Iter>& symbol, CRGB color, int offset=0, int start=0, int end=LED_COLS) {
+  end = min(end, LED_COLS);
+  start = max(start, 0);
 
-  server.on("/off", []() {
-    digitalWrite(led, 1);
-    server.send(200, "text/plain", "this works as well");
-  });
+  if (col - offset >=  end) 
+    return col;
+  
+  // if (col - offset + symbol.cols() < start) {
+  //   return col + symbol.cols();
+  // }
 
-  server.on("/client_test", []() {
-    clientTest();
-    server.send(200, "text/plain", "this works as well");
-  });
-
-  server.onNotFound(handleNotFound);
-
-  server.begin();
+  for (auto row : symbol.rows_iter()) {
+    auto c = col - offset;
+    if (c >= start && c < end) drawColumn(c, row, color);
+    col++;
+  }
+  return col;
 }
+
+void listDir(const char * dirname) {
+  Serial.printf("Listing directory: %s\n", dirname);
+
+  Dir root = LittleFS.openDir(dirname);
+
+  while (root.next()) {
+    File file = root.openFile("r");
+    Serial.print("  FILE: ");
+    Serial.print(root.fileName());
+    Serial.print("  SIZE: ");
+    Serial.print(file.size());
+    time_t cr = file.getCreationTime();
+    time_t lw = file.getLastWrite();
+    file.close();
+    struct tm * tmstruct = localtime(&cr);
+    Serial.printf("    CREATION: %d-%02d-%02d %02d:%02d:%02d\n", (tmstruct->tm_year) + 1900, (tmstruct->tm_mon) + 1, tmstruct->tm_mday, tmstruct->tm_hour, tmstruct->tm_min, tmstruct->tm_sec);
+    tmstruct = localtime(&lw);
+    Serial.printf("  LAST WRITE: %d-%02d-%02d %02d:%02d:%02d\n", (tmstruct->tm_year) + 1900, (tmstruct->tm_mon) + 1, tmstruct->tm_mday, tmstruct->tm_hour, tmstruct->tm_min, tmstruct->tm_sec);
+  }
+}
+
+ bool readConfig(const char * path, config::Config* conf) {
+  Serial.printf("Reading file: %s\n", path);
+
+  File file = LittleFS.open(path, "r");
+  if (!file) {
+    Serial.println("Failed to open file for reading");
+    return false;
+  }
+
+  StreamString configStream;
+  while (file.available()) {
+    file.sendAll(configStream);
+  }
+  file.close();
+
+  return config::parse(configStream, conf);
+}
+
+
+struct LoopState {
+  std::vector<int> currentNextStops;
+  int region_offset;
+  symbol::SymbolArray syms;
+  int cyclesSinceRequest;
+  int configIx;
+  config::Stop stop;
+
+
+  LoopState(): currentNextStops(3, 0), region_offset(0) {} ;
+  void reset(std::vector<int>& nextStops) {
+    currentNextStops = nextStops;
+    region_offset = 0;
+
+    syms.clear();
+    for (auto s : nextStops) {
+      if (s == 0) {
+        syms.append(*symbol::SYM_NUMERIC[0]);
+        syms.append(symbol::SPACE);
+        syms.append(symbol::SPACE);
+      } else {
+        symbol::addNumberToArray(syms, s);
+        syms.append(symbol::SPACE);
+        syms.append(symbol::SPACE);
+      }
+    }
+  }
+
+  void inc() {
+    region_offset = (region_offset + 1) % syms.cols();
+    cyclesSinceRequest++;
+  }
+};
+
+
+LoopState LOOP_STATE; 
+NextStopClient client;
 
 void setup(void) {
   // pinMode(led, OUTPUT);
   // digitalWrite(led, 0);
   Serial.begin(115200);
-  // WiFi.mode(WIFI_STA);
-  // WiFi.begin(ssid, password);
-  // Serial.println("");
 
-  // // // // Wait for connection
-  // while (WiFi.status() != WL_CONNECTED) {
-  //   delay(500);
-  //   Serial.print(".");
-  // }
-  // Serial.println("");
-  // Serial.print("Connected to ");
-  // Serial.println(ssid);
-  // Serial.print("IP address: ");
-  // Serial.println(WiFi.localIP());
-
-  // if (MDNS.begin("esp8266")) {
-  //   Serial.println("MDNS responder started");
-  // }
- 
-  // beginServer();
-  // Serial.println("HTTP server started");
-
-  FastLED.addLeds<WS2812B, DATA_PIN, RGB>(leds, NUM_LEDS);  // GRB ordering is typical
-  FastLED.setBrightness(G_BRIGHTNESS);
-  // FastLED.addLeds<NEOPIXEL, DATA_PIN>(leds, NUM_LEDS);
-  Serial.println("Added leds");
-}
-
-const int SPACE[][8] = {
-  {0, 0, 0, 0, 0, 0, 0, 0},
-  {0, 0, 0, 0, 0, 0, 0, 0},
-}; 
-
-const int ONE[][8] = {
-  {0, 0, 0, 1, 0, 0, 1, 0,},
-  {0, 0, 1, 0, 0, 0, 1, 0,},
-  {0, 1, 1, 1, 1, 1, 1, 0,},
-  {0, 0, 0, 0, 0, 0, 1, 0,},
-};
-
-const int TWO[][8] = {
-  {0, 0, 1, 0, 0, 1, 1, 0,},
-  {0, 1, 0, 0, 1, 0, 1, 0,},
-  {0, 1, 0, 1, 0, 0, 1, 0,},
-  {0, 0, 1, 0, 0, 0, 1, 0,},
-};
-
-const int THREE[][8] = {
-  {0, 0, 1, 0, 0, 1, 0, 0,},
-  {0, 1, 0, 0, 0, 0, 1, 0,},
-  {0, 1, 0, 1, 1, 0, 1, 0,},
-  {0, 0, 1, 0, 0, 1, 0, 0,}
-};
-
-const int FOUR[][8] = {
-  {0, 1, 1, 1, 0, 0, 0, 0,},
-  {0, 0, 0, 1, 0, 0, 0, 0,},
-  {0, 0, 0, 1, 0, 0, 0, 0,},
-  {0, 1, 1, 1, 1, 1, 1, 0,},
-};
-
-const int FIVE[][8] = {
-  {0, 1, 1, 1, 0, 0, 1, 0,},
-  {0, 1, 0, 1, 0, 0, 1, 0,},
-  {0, 1, 0, 1, 0, 0, 1, 0,},
-  {0, 1, 0, 0, 1, 1, 0, 0,},
-};
-
-const int SIX[][8] = {
-  {0, 0, 1, 1, 1, 1, 0, 0,},
-  {0, 1, 0, 1, 0, 0, 1, 0,},
-  {0, 1, 0, 1, 0, 0, 1, 0,},
-  {0, 1, 0, 0, 1, 1, 0, 0,},
-};
-
-const int SEVEN[][8] = {
-  {0, 1, 0, 0, 1, 0, 0, 0,},
-  {0, 1, 0, 0, 1, 0, 0, 0,},
-  {0, 1, 1, 1, 1, 1, 1, 0,},
-  {0, 0, 0, 0, 1, 0, 0, 0,},
-};
-
-const int EIGHT[][8] = {
-  {0, 0, 1, 1, 1, 1, 0, 0,},
-  {0, 1, 0, 0, 1, 0, 1, 0,},
-  {0, 1, 0, 0, 1, 0, 1, 0,},
-  {0, 0, 1, 1, 1, 1, 0, 0,},
-};
-
-const int NINE[][8] = {
-  {0, 0, 1, 1, 0, 0, 1, 0,},
-  {0, 1, 0, 0, 1, 0, 1, 0,},
-  {0, 1, 0, 0, 1, 0, 1, 0,},
-  {0, 0, 1, 1, 1, 1, 0, 0,},
-};
-
-const int ZERO[][8] = {
-  {0, 0, 1, 1, 1, 1, 0, 0,},
-  {0, 1, 0, 0, 0, 0, 1, 0,},
-  {0, 1, 0, 0, 0, 0, 1, 0,},
-  {0, 0, 1, 1, 1, 1, 0, 0,},
-};
-
-int G_OFFSET = 0;
-
-int drawLetter(int ledIx, int w, const int ltr[][8]) {
-  if (ledIx - G_OFFSET >=  NUM_LEDS) 
-    return ledIx;
-  
-  for (int i=0; i < w; i++){
-    for (int j = 0; j < 8 && ledIx - G_OFFSET < NUM_LEDS; j++, ledIx++) {
-      if (ltr[i][ (int(ledIx/8) % 2) ? 8-j -1 : j])
-        if (ledIx - G_OFFSET >= 0 && ledIx - G_OFFSET < NUM_LEDS) leds[ledIx - G_OFFSET] = CRGB::Coral;
-    }
+  if (!LittleFS.begin()) {
+    Serial.println("Err: LittleFS mount failed");
+    return;
   }
 
-  return ledIx;
+  config::Config conf;
+  if (!readConfig("/next_stop.config", &conf)) {
+    Serial.println("Err: Read config failed");
+    return;
+  }
+
+  setupWifi(conf.connection.ssid.c_str(), conf.connection.password.c_str());
+  setupLeds();
+
+  LOOP_STATE = LoopState();
+  LOOP_STATE.cyclesSinceRequest = IDLE_CYCLES;
+
+  LOOP_STATE.stop.direction = conf.stops[conf.active_stop].direction;
+  LOOP_STATE.stop.url = conf.stops[conf.active_stop].url;
+
+  client.setUrl(std::string(LOOP_STATE.stop.url));
 }
 
 void loop(void) { 
-  // clientTest();
+  if (LOOP_STATE.cyclesSinceRequest >= IDLE_CYCLES) {
+    std::vector<int> result(3 ,0);
+    int stops = client.getNextStops(result.begin(), result.end());
+    
+    if (stops == 0) {
+      Serial.printf("No new stops, skipping\n");
+      delay(1000);
+      return;
+    }
+
+    LOOP_STATE.cyclesSinceRequest = 0;
+    for (int i = 0; i < stops; i++) {
+      Serial.printf("In: %d minutes\n", result[i]);
+    }
+
+    if (result != LOOP_STATE.currentNextStops) {
+      LOOP_STATE.reset(result);
+      Serial.printf("Update next stops");
+    }
+  }
+
   for (int i=0; i<NUM_LEDS; i++){
     leds[i] = CRGB::Black;
   }
 
-  int ledIx = 0;
+  int col = 0;
 
-  ledIx = drawLetter(ledIx, 4, ONE);
-  ledIx = drawLetter(ledIx, 1, SPACE);
+  ////////  Line  ////////
+  col = drawSymbol(col, symbol::SymbolArray {
+    symbol::ONE_TRAIN,
+    symbol::SPACE
+  }, CRGB::Green, 0);
 
-  ledIx = drawLetter(ledIx, 4, TWO);
-  ledIx = drawLetter(ledIx, 1, SPACE);
 
-  ledIx = drawLetter(ledIx, 4, THREE);
-  ledIx = drawLetter(ledIx, 1, SPACE);
+  ////////  Direction  ////////
+  col = drawSymbol(col, symbol::SymbolArray {
+    (LOOP_STATE.stop.direction == config::Direction::South) ? symbol::ARROW_DOWN : symbol::ARROW_UP,
+    symbol::SPACE
+  }, CRGB::Yellow, 0);
 
-  ledIx = drawLetter(ledIx, 4, FOUR);
-  ledIx = drawLetter(ledIx, 1, SPACE);
-
-  ledIx = drawLetter(ledIx, 4, FIVE);
-  ledIx = drawLetter(ledIx, 1, SPACE);
-
-  // ledIx = drawLetter(ledIx, 4 - (G_OFFSET), FIVE + G_OFFSET);
-  // ledIx = drawLetter(ledIx, 1, SPACE);
-
-  // ledIx = drawLetter(ledIx, 2, FIVE + 2);
-  // ledIx = drawLetter(ledIx, 1, SPACE);
-
-  // ledIx = drawLetter(ledIx, 1, FIVE + 3);
-  // ledIx = drawLetter(ledIx, 1, SPACE);
-
-  ledIx = drawLetter(ledIx, 4, SIX);
-  ledIx = drawLetter(ledIx, 1, SPACE);
-
-  ledIx = drawLetter(ledIx, 4, SEVEN);
-  ledIx = drawLetter(ledIx, 1, SPACE);
-
-  ledIx = drawLetter(ledIx, 4, EIGHT);
-  ledIx = drawLetter(ledIx, 1, SPACE);
-
-  ledIx = drawLetter(ledIx, 4, NINE);
-  ledIx = drawLetter(ledIx, 1, SPACE);
-
-  ledIx = drawLetter(ledIx, 4, ZERO);
+  ////////  Minutes  ////////
+  int minutesStartCol = col;
+  col = drawSymbol(col, LOOP_STATE.syms, CRGB::Red, LOOP_STATE.region_offset, minutesStartCol);
 
   FastLED.show();
-  FastLED.delay(500);
-
-  G_OFFSET = (G_OFFSET + 16) % (10*32);
-
-  // FastLED.show();
-  // FastLED.delay(1000);
+  FastLED.delay(800);
+  LOOP_STATE.inc();
 }
-
-/*
-* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
-* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
-* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
-* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
-* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
-* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
-* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
-* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
-*/

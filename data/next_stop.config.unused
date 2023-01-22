@@ -1,0 +1,14 @@
+{
+    "active_stop": 0,
+    "connection": {
+        "ssid":  "",
+        "password": ""
+    },
+    "stops": [{
+        "direction": "South",
+        "url": "http://192.168.1.5:3000/next_train/from/116%20St-Columbia%20University/direction/117S?future_only=true&limit_direction_departures=3"
+    }, {
+        "direction": "North",
+        "url": "http://192.168.1.5:3000/next_train/from/116%20St-Columbia%20University/direction/117N?future_only=true&limit_direction_departures=3"
+    }]
+}
