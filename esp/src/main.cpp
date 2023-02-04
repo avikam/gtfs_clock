@@ -29,7 +29,6 @@ int G_BRIGHTNESS = 2;
 // Define the array of leds
 CRGB leds[NUM_LEDS];
 
-ESP8266WebServer server(80);
 static const char* deviceName = "NextStop"; 
 static const char* timestampHeader = "x-timestamp";
 static const char* headerKeys[] = {
