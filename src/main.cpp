@@ -37,7 +37,6 @@ static const char* headerKeys[] = {
 };
 #define HEADERS_KEYS_SIZE 1
 
-
 #define IDLE_CYCLES 10
 using vec_iter = std::vector<int>::iterator;
 
