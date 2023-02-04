@@ -6,6 +6,7 @@ use std::io::{self, Error, BufRead};
 use std::time::Duration;
 
 
+use hyper::StatusCode;
 use prost::Message;
 use chrono::{DateTime, TimeZone, Utc, Local, Timelike};
 use prost::encoding::int32;
@@ -78,8 +79,10 @@ impl MapByStop {
 
     fn append(&mut self, stop: String, entry: Entry) {
         let mut value = self.cache.entry(stop.to_owned()).or_default();
-        // TODO: push sorted
-        value.push(entry);
+        let search_res = value.binary_search_by_key(&entry.arriving_at_timestamp, |e| e.arriving_at_timestamp);
+
+        let push_index = search_res.unwrap_or_else(|ix| ix);
+        value.insert(push_index, entry);
     }
 }
 
@@ -228,7 +231,12 @@ async fn main() {
     }
 }
 
-async fn next_train_handler(State(state): State<Arc<AppState>>, from: &str, future_only: Option<bool>, limit_direction_departures: Option<i8>) -> Json<Vec<Entry>> {
+async fn next_train_handler(
+    State(state): State<Arc<AppState>>, 
+    from: &str, direction: &str, 
+    future_only: Option<bool>, 
+    limit_direction_departures: Option<i8>
+) -> Json<Vec<Entry>> {
     let mut s = state.cache_from.read().await;
     let cache_from = &s.cache;
     let sample_time = s.sample_time.timestamp_millis() / 1000;
@@ -244,7 +252,12 @@ async fn next_train_handler(State(state): State<Arc<AppState>>, from: &str, futu
             entries.iter().filter(|e| 
                 !future_only || 
                 (e.arriving_at_timestamp - sample_time) >= 0
-            ).filter(|e| {
+            ).
+            filter(|e| 
+                direction.is_empty() || 
+                direction.cmp(&e.direction).is_eq()
+            )
+            .filter(|e| {
                 *direction_counters.entry(e.direction.as_str()).or_default() += 1;
                 limit_direction_departures <= 0 || direction_counters[e.direction.as_str()] <= limit_direction_departures
             })
@@ -293,7 +306,20 @@ async fn web_server(_state: Arc<AppState>) {
                 debug!("{}, {}", from, q.future_only.is_some());
                 next_train_handler(
                     state, 
+                    from.as_ref(),
+                    "", 
+                    q.future_only,
+                    q.limit_direction_departures
+                ).await
+            }
+        ))
+        .route("/next_train/from/:from/direction/:direction", get(
+            |Path((from, direction)): Path<(String, String)>, Query(q): Query<NextTrainQuery>, state: State<Arc<AppState>>| async move { 
+                debug!("from={}, future_only={}, direction={}", from, q.future_only.is_some(), direction);
+                next_train_handler(
+                    state, 
                     from.as_ref(), 
+                    direction.as_ref(),
                     q.future_only,
                     q.limit_direction_departures
                 ).await
